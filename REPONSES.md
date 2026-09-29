@@ -128,3 +128,161 @@ Le fichier propre a ensuite été régénéré (`python data/generate_offres.py`
 - `GET offres/_doc/OFF-00002` → *Analyste Cybersécurité Senior*, Cévennes Data, Paris.
 
 Data view `offres` créée avec le champ temporel `date_publication`. Dans **Discover** sur « Last 1 year », l'histogramme couvre avril → septembre 2026, mais le compteur affiche **4 968** documents et non 5 000 : les **32 offres datées du 30/09/2026** (date de référence du générateur) sont dans le futur au moment de la consultation (29/09/2026) et donc hors de la plage « jusqu'à maintenant ». 4 968 + 32 = 5 000. Les dates s'affichent à 02:00 car elles sont stockées en UTC et affichées dans le fuseau du navigateur (Europe/Paris).
+
+## Partie 3 — Recherche et analyseurs
+
+### Exercice 3.1 — Voir travailler un analyseur
+
+Phrase : *Les développeuses travaillaient sur l'analyse des données*
+
+| Analyseur | Tokens produits |
+| --- | --- |
+| `standard` | `les` · `développeuses` · `travaillaient` · `sur` · `l'analyse` · `des` · `données` |
+| `french` | `developeu` · `travailaient` · `analys` · `done` |
+
+**Quels mots disparaissent avec `french` ?** Les **mots vides** : `les`, `sur`, `des` (et l'article élidé `l'`). `standard` ne fait que découper et mettre en minuscules : il garde tous les mots.
+
+**Que devient `l'analyse` ?** Avec `standard`, c'est un seul token `l'analyse` (l'apostrophe n'est pas un séparateur). Avec `french`, le filtre d'**élision** retire `l'`, puis la **racinisation** réduit le mot à `analys`.
+
+**« donnée » et « données » donnent-ils le même terme ?**
+- `standard` : non — `donnée` et `données` sont deux termes différents ;
+- `french` : oui — les deux deviennent `done` (accents retirés, pluriel et « e » final supprimés par le stemmer léger français).
+
+**Conséquence pour la recherche :** avec un champ analysé en `french`, une recherche sur « donnée » retrouve aussi les documents qui contiennent « données » (et inversement), de même pour singulier/pluriel, masculin/féminin ou avec/sans accent. Avec `standard`, seule la forme exacte (en minuscules) correspondrait. C'est pour cela que `titre`, `description` et `competences.texte` utilisent l'analyseur `french`. Contrepartie : la racinisation peut rapprocher des mots différents (perte de précision).
+
+### Exercice 3.2 — `match` contre `term`
+
+| Requête | Résultats |
+| --- | --- |
+| `match` `description: "projets bancaires"` | 4 190 |
+| `term` `ville: "paris"` | **0** |
+| `term` `titre: "Data Engineer Senior"` | **0** |
+| `term` `ville: "Paris"` (corrigée) | 1 492 |
+| `term` `titre.brut: "Data Engineer Senior"` (corrigée) | 103 |
+| `match` `description` avec `"operator": "and"` | 393 |
+
+**Pourquoi les deux `term` renvoient-ils 0 ?** `term` n'analyse **pas** la valeur cherchée : il la compare telle quelle aux termes de l'index.
+- `ville` est un `keyword` stocké tel quel (`Paris`, avec majuscule) : `paris` ≠ `Paris`. Correction : `"ville": "Paris"`.
+- `titre` est un `text` analysé en `french` : l'index ne contient pas la chaîne entière mais les tokens `data`, `engin`, `senio`. La chaîne `Data Engineer Senior` n'y existe donc pas. Correction : chercher sur le sous-champ `keyword` → `"titre.brut": "Data Engineer Senior"` (ou utiliser `match` sur `titre`).
+
+**Effet de `"operator": "and"` :** on passe de **4 190 à 393** résultats. Par défaut, `match` combine les tokens en **OU** : un document qui contient seulement « projets » (présent dans une grande partie des descriptions) suffit. Avec `and`, **tous** les tokens doivent être présents : il ne reste que les offres sur des projets **bancaires**, qui ont en outre le meilleur score (2,82).
+
+### Exercice 3.3 — Plusieurs champs, pondération et fautes de frappe
+
+| Variante | Résultats |
+| --- | --- |
+| `multi_match` « kubernetis terraform » | 739 (seul « terraform » correspond ; « kubernetis » seul → 0) |
+| + `"fuzziness": "AUTO"` | 969 |
+| + `titre^3` | 969, même ordre et mêmes scores |
+
+**Quel paramètre rattrape la faute ?** `"fuzziness": "AUTO"`. Il accepte des termes à une distance d'édition de Levenshtein limitée (1 modification pour 3 à 5 caractères, 2 au-delà) : `kuberneti` (racine de « kubernetis ») retrouve `kubernet` (racine de « Kubernetes »). Le nombre de résultats passe de 739 à 969 et les offres qui ont **Kubernetes et Terraform** remontent en tête (score 5,74 contre 3,11).
+
+**Comment évolue l'ordre avec le poids sur `titre` ?** Ici, **il ne change pas** : aucun titre ne contient « kubernetes » ni « terraform » (les titres sont « métier + niveau »). Le poids `^3` multiplie un score nul sur `titre`, et `multi_match` (`best_fields`) garde le meilleur champ, qui reste `competences.texte`/`description`. Pour vérifier l'effet du poids, avec « cloud terraform » : sans poids, le top 5 mélange Architecte Cloud et Ingénieur DevOps (score 3,11) ; avec `titre^3`, **les 5 premiers sont tous des « Architecte Cloud »** (score 6,83), car « cloud » apparaît dans leur titre. Le poids fait remonter les documents dont le champ pondéré correspond.
+
+### Exercice 3.4 — Requête `bool`
+
+`must` : `multi_match` « données » sur `titre` + `description` ; `filter` : `contrat = CDI`, `ville ∈ {Montpellier, Toulouse}`, `salaire_max ≥ 50 000` ; `must_not` : `teletravail = aucun` ; `should` : `competences = Elasticsearch`.
+
+Résultat : **25 offres**, toutes des « Administrateur Bases de Données » (seuls titres contenant « données » ; aucune description n'emploie ce mot).
+
+**Comparaison des `_score` avec et sans `should` :**
+- sans `should` : tous les résultats ont le même score **2,048** ;
+- avec `should` : les offres dont les compétences contiennent Elasticsearch passent à **4,015** et sont classées en tête ; les autres restent à 2,048.
+
+Le nombre de résultats est **identique (25)** : en présence de `must`/`filter`, le `should` n'est pas obligatoire, il ne fait qu'ajouter un **bonus de score**.
+
+**Pourquoi mettre les critères exacts dans `filter` plutôt que dans `must` ?**
+1. **Pertinence** : un critère oui/non (CDI, ville, salaire) ne doit pas influencer le score. Dans `filter`, il ne calcule pas de score ; dans `must`, il fausserait le classement (un document « plus CDI » que l'autre n'a pas de sens).
+2. **Performance** : le contexte filtre évite le calcul BM25 et ses résultats sont **mis en cache** (bitsets réutilisés d'une requête à l'autre).
+
+### Exercice 3.5 — Recherche géographique
+
+**340 offres** à moins de 20 km de Montpellier (43.6108, 3.8767), toutes situées à Montpellier (aucune autre ville du corpus dans ce rayon). Triées par distance : la plus proche à **0,19 km** (Développeur Java Confirmé), la plus lointaine à **6,65 km** — cohérent avec le bruit de ±0,05° appliqué par le générateur autour du centre-ville. La valeur de `sort` donne la distance en km ; `_score` vaut `null` car on trie par distance et le critère est en contexte filtre.
+
+### Exercice 3.6 — Pagination et surlignage
+
+Page 2 par pages de 5 : `"from": 5, "size": 5` (résultats 6 à 10) ; `"_source": ["titre", "entreprise", "ville"]` ; `"highlight": { "fields": { "description": {} } }`.
+
+Constat : le surlignage sur `description` est **vide**, car aucune description du corpus ne contient « donnée(s) » : c'est le titre qui correspond. J'ai donc ajouté `titre` au `highlight`, qui renvoie par exemple `Administrateur Bases de <em>Données</em> Lead`. Le surligneur applique le même analyseur que la recherche (`Données` est mis en évidence grâce à la racine `done`).
+
+**Pourquoi `from + size` est-il limité à 10 000, et quoi utiliser au-delà ?**
+Pour renvoyer les résultats `from` à `from + size`, chaque shard doit trier et renvoyer ses `from + size` meilleurs résultats au nœud coordinateur, qui les fusionne : le coût en mémoire et en CPU croît avec la profondeur de la page. La limite `index.max_result_window = 10 000` protège le cluster. Au-delà, on utilise **`search_after`** (on passe les valeurs de tri du dernier résultat de la page précédente) avec un **point in time** (`POST offres/_pit?keep_alive=1m`) pour que la pagination porte sur une vue figée et cohérente de l'index, même s'il est modifié entre deux pages.
+
+## Partie 4 — Agrégations
+
+### Exercice 4.1 — Offres et salaire moyen par ville
+
+| Ville | Offres | Offres avec salaire | Salaire min. moyen |
+| --- | --- | --- | --- |
+| **Paris** | 1 492 | 994 | **57 442 €** |
+| Grenoble | 90 | 65 | 53 046 € |
+| Nantes | 414 | 280 | 52 125 € |
+| Toulouse | 424 | 296 | 52 047 € |
+| Strasbourg | 177 | 126 | 51 976 € |
+| Marseille | 325 | 216 | 51 407 € |
+| Montpellier | 340 | 227 | 51 203 € |
+| Rennes | 269 | 186 | 51 038 € |
+| Bordeaux | 402 | 277 | 51 036 € |
+| Lyon | 589 | 412 | 50 818 € |
+| Lille | 367 | 231 | 50 316 € |
+| Nice | 111 | 79 | 49 456 € |
+
+**Quelle ville a le salaire moyen le plus élevé ?** **Paris** (≈ 57 442 €), environ 4 000 à 8 000 € de plus que les autres villes : on retrouve la majoration parisienne de +6 000 € du générateur.
+
+**Sur combien d'offres la moyenne est-elle réellement calculée ?** Uniquement sur les documents qui **ont** le champ `salaire_min` : **3 389 offres sur 5 000** (CDI et CDD). Les 1 611 offres en alternance, stage et freelance n'ont pas ce champ et sont ignorées par `avg` (un champ absent n'est pas compté comme 0). Exemple : Paris a 1 492 offres mais la moyenne porte sur 994 d'entre elles (vérifié avec une sous-agrégation `value_count`).
+
+**En remplaçant `ville` par `titre` :** erreur `400` — *Fielddata is disabled on [titre] in [offres]. Text fields are not optimised for operations that require per-document field data like aggregations and sorting…* Un champ `text` est découpé en tokens et n'a pas de *doc values* : on ne peut pas regrouper sur sa valeur entière. **Correction :** agréger sur le sous-champ `keyword` → `"field": "titre.brut"` (activer `fielddata` sur `titre` est déconseillé : coûteux en mémoire, et les buckets seraient des tokens, pas des titres).
+
+### Exercice 4.2 — Publications par mois
+
+| Mois | Offres | CDI | Alternance | CDD | Freelance | Stage |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2026-04 | 763 | 443 | 114 | 76 | 92 | 38 |
+| 2026-05 | 865 | 476 | 127 | 105 | 103 | 54 |
+| 2026-06 | 820 | 461 | 125 | 102 | 94 | 38 |
+| 2026-07 | 835 | 459 | 135 | 100 | 108 | 33 |
+| 2026-08 | 880 | 476 | 134 | 119 | 108 | 43 |
+| 2026-09 | 837 | 460 | 119 | 112 | 108 | 38 |
+
+Total : 5 000 offres sur 6 mois (avril → septembre 2026), réparties de façon régulière ; le CDI représente environ 55 % des offres chaque mois.
+
+### Exercice 4.3 — Tranches de salaire et statistiques
+
+| Tranche de `salaire_min` | Offres |
+| --- | --- |
+| < 40 k | 484 |
+| 40–55 k | 1 363 |
+| ≥ 55 k | 1 542 |
+
+Total 3 389 (seules les offres avec salaire entrent dans les tranches). Rappel : dans une agrégation `range`, `from` est **inclus** et `to` **exclu**.
+
+`stats` sur `experience_annees` : `count` 5 000, `min` 0, `max` 15, `avg` ≈ 5,91 ans, `sum` 29 564.
+
+### Exercice 4.4 — Requête + agrégation
+
+Requête `match_phrase` « Data Engineer » sur `titre` → **462 offres**.
+
+- **5 compétences les plus demandées :** Airflow (315), Spark (313), Kafka (312), Python (311), SQL (301).
+- **Télétravail le plus fréquent :** **partiel** (284 offres sur 462).
+
+**L'agrégation porte-t-elle sur tout l'index ou seulement sur les résultats ?** **Seulement sur les documents sélectionnés par la `query`.** Preuve : sur tout l'index, le top 5 est différent — Python (1 320), Elasticsearch (1 279), Linux (1 003), Git (1 000), Docker (986). Pour agréger sur tout l'index malgré une requête, il faudrait une agrégation `global`.
+
+### Bonus — ES|QL
+
+```
+POST _query
+{ "query": "FROM offres | STATS salaire_moyen = AVG(salaire_min) BY ville | SORT salaire_moyen DESC" }
+```
+
+Même résultat que l'exercice 4.1 : Paris 57 441,6 €, Grenoble 53 046,2 €, Nantes 52 125 €…
+
+## Mini-défi — `search.py`
+
+- Requête `bool` : `must` = `multi_match` sur `titre^3`, `competences.texte^2`, `description` avec `fuzziness: AUTO` ; `filter` optionnels = `ville`, `contrat`, `teletravail` (`term`), `salaire_max ≥ --salaire-min` (`range`), `geo_distance` autour de `--autour` dans `--rayon`.
+- Pagination `from = (page − 1) × taille`, `size = taille`, avec garde-fou à 10 000 résultats.
+- Extrait surligné (description, compétences ou titre ; `<em>` affiché en `[ ]` dans le terminal).
+- Trois facettes `terms` : villes, contrats, compétences — calculées sur les résultats filtrés.
+
+Exemples de volumes obtenus : « développeur python » → 3 996 offres (les « Développeur Python » en tête, score 10,62) ; « données spark » à Lyon en CDI avec salaire ≥ 45 000 → 180 offres (Data Engineer en tête).
+
+Limite observée : `fuzziness: AUTO` élargit parfois trop (ex. « données » → racine `done`, qui rapproche aussi `bonne`). En production, on limiterait le flou aux termes longs (`"fuzziness": "AUTO:4,7"`) ou on le réserverait aux champs `titre`/`competences`.

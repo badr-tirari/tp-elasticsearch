@@ -1,0 +1,179 @@
+# =====================================================================
+# TP Introduction à Elasticsearch — Partie 3 : recherche et analyseurs
+# Requêtes Kibana Dev Tools (Console)
+# =====================================================================
+
+# ---------- Exercice 3.1 — Voir travailler un analyseur ----------
+POST _analyze
+{ "analyzer": "standard", "text": "Les développeuses travaillaient sur l'analyse des données" }
+
+POST _analyze
+{ "analyzer": "french", "text": "Les développeuses travaillaient sur l'analyse des données" }
+
+POST _analyze
+{ "analyzer": "standard", "text": "donnée" }
+
+POST _analyze
+{ "analyzer": "standard", "text": "données" }
+
+POST _analyze
+{ "analyzer": "french", "text": "donnée" }
+
+POST _analyze
+{ "analyzer": "french", "text": "données" }
+
+# ---------- Exercice 3.2 — match contre term ----------
+GET offres/_search
+{ "query": { "match": { "description": "projets bancaires" } } }
+
+# Renvoient 0 résultat :
+GET offres/_search
+{ "query": { "term": { "ville": "paris" } } }
+
+GET offres/_search
+{ "query": { "term": { "titre": "Data Engineer Senior" } } }
+
+# Corrections : valeur exacte (casse respectée) et sous-champ keyword "brut"
+GET offres/_search
+{ "query": { "term": { "ville": "Paris" } } }
+
+GET offres/_search
+{ "query": { "term": { "titre.brut": "Data Engineer Senior" } } }
+
+# Pour comprendre : tokens produits pour le champ titre
+GET offres/_analyze
+{ "field": "titre", "text": "Data Engineer Senior" }
+
+# match avec opérateur AND : tous les termes doivent être présents
+GET offres/_search
+{
+  "query": {
+    "match": { "description": { "query": "projets bancaires", "operator": "and" } }
+  }
+}
+
+# ---------- Exercice 3.3 — multi_match, fuzziness, pondération ----------
+GET offres/_search
+{
+  "query": {
+    "multi_match": {
+      "query": "kubernetis terraform",
+      "fields": ["titre", "competences.texte", "description"]
+    }
+  }
+}
+
+GET offres/_search
+{
+  "query": {
+    "multi_match": {
+      "query": "kubernetis terraform",
+      "fields": ["titre", "competences.texte", "description"],
+      "fuzziness": "AUTO"
+    }
+  }
+}
+
+GET offres/_search
+{
+  "query": {
+    "multi_match": {
+      "query": "kubernetis terraform",
+      "fields": ["titre^3", "competences.texte", "description"],
+      "fuzziness": "AUTO"
+    }
+  }
+}
+
+# Effet visible du poids avec un terme présent dans les titres
+GET offres/_search
+{
+  "query": {
+    "multi_match": {
+      "query": "cloud terraform",
+      "fields": ["titre^3", "competences.texte", "description"],
+      "fuzziness": "AUTO"
+    }
+  }
+}
+
+# ---------- Exercice 3.4 — Requête bool ----------
+GET offres/_search
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "multi_match": { "query": "données", "fields": ["titre", "description"] } }
+      ],
+      "filter": [
+        { "term":  { "contrat": "CDI" } },
+        { "terms": { "ville": ["Montpellier", "Toulouse"] } },
+        { "range": { "salaire_max": { "gte": 50000 } } }
+      ],
+      "must_not": [
+        { "term": { "teletravail": "aucun" } }
+      ],
+      "should": [
+        { "term": { "competences": "Elasticsearch" } }
+      ]
+    }
+  }
+}
+
+# Même requête sans le bloc should (comparaison des _score)
+GET offres/_search
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "multi_match": { "query": "données", "fields": ["titre", "description"] } }
+      ],
+      "filter": [
+        { "term":  { "contrat": "CDI" } },
+        { "terms": { "ville": ["Montpellier", "Toulouse"] } },
+        { "range": { "salaire_max": { "gte": 50000 } } }
+      ],
+      "must_not": [
+        { "term": { "teletravail": "aucun" } }
+      ]
+    }
+  }
+}
+
+# ---------- Exercice 3.5 — Recherche géographique ----------
+GET offres/_search
+{
+  "query": { "bool": { "filter": { "geo_distance": {
+    "distance": "20km", "localisation": { "lat": 43.6108, "lon": 3.8767 } } } } },
+  "sort": [ { "_geo_distance": {
+    "localisation": { "lat": 43.6108, "lon": 3.8767 }, "order": "asc", "unit": "km" } } ]
+}
+
+# ---------- Exercice 3.6 — Pagination et surlignage ----------
+GET offres/_search
+{
+  "from": 5,
+  "size": 5,
+  "_source": ["titre", "entreprise", "ville"],
+  "query": {
+    "bool": {
+      "must": [
+        { "multi_match": { "query": "données", "fields": ["titre", "description"] } }
+      ],
+      "filter": [
+        { "term":  { "contrat": "CDI" } },
+        { "terms": { "ville": ["Montpellier", "Toulouse"] } },
+        { "range": { "salaire_max": { "gte": 50000 } } }
+      ],
+      "must_not": [
+        { "term": { "teletravail": "aucun" } }
+      ],
+      "should": [
+        { "term": { "competences": "Elasticsearch" } }
+      ]
+    }
+  },
+  "highlight": {
+    "fields": { "description": {}, "titre": {} }
+  }
+}

@@ -1,0 +1,99 @@
+# =====================================================================
+# TP Introduction à Elasticsearch — Partie 4 : agrégations
+# Requêtes Kibana Dev Tools (Console)
+# =====================================================================
+
+# ---------- Exercice 4.1 — Offres et salaire moyen par ville ----------
+GET offres/_search
+{
+  "size": 0,
+  "aggs": {
+    "par_ville": {
+      "terms": { "field": "ville", "size": 12, "order": { "salaire_moyen": "desc" } },
+      "aggs": {
+        "salaire_moyen": { "avg": { "field": "salaire_min" } },
+        "nb_offres_avec_salaire": { "value_count": { "field": "salaire_min" } }
+      }
+    }
+  }
+}
+
+# Erreur : agrégation terms sur un champ text
+GET offres/_search
+{
+  "size": 0,
+  "aggs": { "par_titre": { "terms": { "field": "titre", "size": 12 } } }
+}
+
+# Correction : sous-champ keyword titre.brut
+GET offres/_search
+{
+  "size": 0,
+  "aggs": {
+    "par_titre": {
+      "terms": { "field": "titre.brut", "size": 12, "order": { "salaire_moyen": "desc" } },
+      "aggs": { "salaire_moyen": { "avg": { "field": "salaire_min" } } }
+    }
+  }
+}
+
+# ---------- Exercice 4.2 — Publications par mois, ventilées par contrat ----------
+GET offres/_search
+{
+  "size": 0,
+  "aggs": {
+    "par_mois": {
+      "date_histogram": {
+        "field": "date_publication",
+        "calendar_interval": "month",
+        "format": "yyyy-MM"
+      },
+      "aggs": {
+        "par_contrat": { "terms": { "field": "contrat" } }
+      }
+    }
+  }
+}
+
+# ---------- Exercice 4.3 — Tranches de salaire et statistiques ----------
+GET offres/_search
+{
+  "size": 0,
+  "aggs": {
+    "tranches_salaire": {
+      "range": {
+        "field": "salaire_min",
+        "ranges": [
+          { "key": "< 40 k",   "to": 40000 },
+          { "key": "40–55 k",  "from": 40000, "to": 55000 },
+          { "key": "≥ 55 k",   "from": 55000 }
+        ]
+      }
+    },
+    "experience": { "stats": { "field": "experience_annees" } }
+  }
+}
+
+# ---------- Exercice 4.4 — Requête + agrégation ----------
+GET offres/_search
+{
+  "size": 0,
+  "query": { "match_phrase": { "titre": "Data Engineer" } },
+  "aggs": {
+    "top_competences": { "terms": { "field": "competences", "size": 5 } },
+    "teletravail":     { "terms": { "field": "teletravail", "size": 1 } }
+  }
+}
+
+# Comparaison : mêmes agrégations sur tout l'index
+GET offres/_search
+{
+  "size": 0,
+  "aggs": { "top_competences": { "terms": { "field": "competences", "size": 5 } } }
+}
+
+# ---------- Bonus — équivalent ES|QL de l'exercice 4.1 ----------
+POST _query
+{
+  "query": "FROM offres | STATS salaire_moyen = AVG(salaire_min) BY ville | SORT salaire_moyen DESC"
+}
