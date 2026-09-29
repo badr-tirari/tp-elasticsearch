@@ -9,7 +9,7 @@ Les requêtes correspondantes sont dans `requetes/`.
 Oui. Kibana Dev Tools, curl (et Hoppscotch) appellent la même API REST sur le port 9200 : le JSON renvoyé par `GET /` est identique (`name: es01`, `cluster_name: tp-eisi`, `version.number: 9.5.4`, `tagline: "You Know, for Search"`). Seule la présentation change.
 
 **Quel code HTTP sans authentification, et que dit le message d'erreur ?**
-`401 Unauthorized`, avec une erreur `security_exception` : *missing authentication credentials for REST request [/]*. La sécurité est activée (`xpack.security.enabled=true`) : toute requête doit porter des identifiants (Basic Auth, clé d'API ou jeton).
+`401 Unauthorized`, avec une erreur `security_exception` : *missing authentication credentials for REST request [/?pretty]*, et l'en-tête `WWW-Authenticate` indique les méthodes acceptées (`Basic`, `ApiKey`). La sécurité est activée (`xpack.security.enabled=true`) : toute requête doit porter des identifiants (Basic Auth, clé d'API ou jeton).
 
 **Pourquoi Kibana n'a-t-il pas besoin du mot de passe à chaque requête ?**
 On s'authentifie une seule fois à la connexion à Kibana : Kibana crée une **session** (cookie dans le navigateur, session stockée dans l'index système `.kibana_security_session_*`). Les requêtes de la Console passent ensuite par le serveur Kibana, qui les relaie à Elasticsearch avec les droits de l'utilisateur connecté (`elastic`). Kibana lui-même se connecte au cluster avec son compte technique `kibana_system`.
@@ -79,3 +79,52 @@ Index créé avec `"dynamic": "strict"`, 1 shard, 0 réplique → santé **green
 - Chaque champ a le type voulu dès le départ (les types ne peuvent plus changer ensuite sans réindexation).
 
 Nettoyage effectué : `DELETE essai` et `DELETE essai2` → `acknowledged: true`.
+
+## Partie 2 — Ingestion en Python
+
+### Exercice 2.1 — `ingest.py`
+
+`python ingest.py --reset` : l'index `offres` est recréé avec le mapping de l'exercice 1.4, puis **5000 documents indexés, 0 erreurs, 5000 documents dans 'offres'**.
+
+Points clés du script :
+- `lire_actions()` est un **générateur** (`yield`) : le fichier est lu ligne à ligne en `utf-8`, la mémoire consommée ne dépend pas de la taille du fichier ;
+- chaque action fixe `_id` = champ métier `id` (`OFF-00001`…) ;
+- `--reset` → `es.indices.delete(..., ignore_unavailable=True)` (pas d'erreur si l'index n'existe pas) ;
+- création conditionnelle (`es.indices.exists()`), `helpers.bulk(chunk_size=1000, raise_on_error=False)`, affichage des erreurs, puis `refresh` et `count`.
+
+### Exercice 2.2 — Idempotence et identifiants
+
+**Le nombre de documents a-t-il doublé ?**
+Non : après une seconde exécution sans `--reset`, on a toujours **5000 documents**. En revanche `GET offres/_doc/OFF-00002` montre `_version: 3` : le document a été réécrit à chaque ingestion (remplacé, pas dupliqué), et `_cat/indices` affiche des `docs.deleted` correspondant aux anciennes versions en attente de fusion des segments.
+
+**Pourquoi fixer `_id` à partir du champ `id` est-il essentiel ?**
+L'action `index` avec un `_id` connu **remplace** le document existant. Relancer le pipeline (après une panne, une correction, un rejeu) ne crée donc jamais de doublon : l'ingestion est **idempotente**, et l'offre `OFF-00002` reste adressable directement par son identifiant métier.
+
+**Que se passerait-il avec des identifiants générés par Elasticsearch ?**
+Chaque exécution créerait de **nouveaux** documents avec de nouveaux `_id` aléatoires : 10 000 documents après deux lancements, 15 000 après trois… Les comptages et agrégations seraient faussés, et il faudrait dédoublonner a posteriori.
+
+### Exercice 2.3 — Provoquer une erreur de mapping
+
+Ligne ajoutée : copie de la dernière offre avec `"id": "OFF-99999"` et `"prime": 3000`. Sortie :
+
+```
+5000 documents indexés, 1 erreurs
+  - _id=OFF-99999 : strict_dynamic_mapping_exception — [1:703] mapping set to strict, dynamic introduction of [prime] within [_doc] is not allowed
+5000 documents dans 'offres'
+```
+
+**Le lot entier est-il rejeté ou seulement ce document ?**
+**Seulement ce document.** L'API `_bulk` renvoie un statut par opération : les 5000 autres documents du même lot sont indexés, `OFF-99999` est refusé (`GET offres/_doc/OFF-99999` → `found: false`).
+
+**Intérêt de `raise_on_error=False` pour un pipeline ?**
+Avec la valeur par défaut (`True`), `helpers.bulk` lève une `BulkIndexError` au premier lot contenant une erreur, et le script s'arrête sans traiter la suite. Avec `False`, le pipeline **va jusqu'au bout**, renvoie la liste des rejets et permet de les journaliser, de les compter ou de les mettre de côté (file d'erreurs / *dead letter queue*) pour correction, sans bloquer les données valides.
+
+Le fichier propre a ensuite été régénéré (`python data/generate_offres.py`).
+
+### Exercice 2.4 — Vérifier dans Kibana
+
+- `GET _cat/indices/offres?v` : index **green**, 1 primaire, 0 réplique, `docs.count` 5000 (≈ 3,9 Mo) ;
+- `GET offres/_count` → `5000` ;
+- `GET offres/_doc/OFF-00002` → *Analyste Cybersécurité Senior*, Cévennes Data, Paris.
+
+Data view `offres` créée avec le champ temporel `date_publication`. Dans **Discover** sur « Last 1 year », l'histogramme couvre avril → septembre 2026, mais le compteur affiche **4 968** documents et non 5 000 : les **32 offres datées du 30/09/2026** (date de référence du générateur) sont dans le futur au moment de la consultation (29/09/2026) et donc hors de la plage « jusqu'à maintenant ». 4 968 + 32 = 5 000. Les dates s'affichent à 02:00 car elles sont stockées en UTC et affichées dans le fuseau du navigateur (Europe/Paris).

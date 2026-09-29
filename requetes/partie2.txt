@@ -1,0 +1,15 @@
+# =====================================================================
+# TP Introduction à Elasticsearch — Partie 2 : vérifications (exercice 2.4)
+# L'ingestion elle-même est faite par ingest.py
+# =====================================================================
+
+GET _cat/indices/offres?v
+GET offres/_count
+GET offres/_doc/OFF-00002
+
+# Exercice 2.3 : le document piégé a bien été rejeté ("found": false)
+GET offres/_doc/OFF-99999
+
+# Explication de l'écart Discover (4 968) / _count (5 000)
+GET offres/_count
+{ "query": { "term": { "date_publication": "2026-09-30" } } }
