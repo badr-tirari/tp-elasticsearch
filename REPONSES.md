@@ -498,3 +498,120 @@ Le fichier `data/offres_test.ndjson` est ensuite supprimé (il est aussi ignoré
 **Quel réglage change ce comportement, et quelle garantie obtient-on ?** `queue.type: persisted` (file persistée sur disque, dans `path.data/queue`, taille bornée par `queue.max_bytes`). Un événement n'est retiré de la file qu'après **acquittement** par la sortie. Au redémarrage, Logstash rejoue tout ce qui n'avait pas été acquitté. Garantie : **« au moins une fois »** (*at-least-once*) — aucune perte, mais un même événement peut être envoyé **deux fois** (s'il avait été indexé juste avant le kill, sans que l'acquittement ait été enregistré).
 
 **Pourquoi le `document_id` de la partie 1 devient-il indispensable ?** Parce que *at-least-once* implique des **renvois**. Avec `document_id => "%{id}"`, un renvoi réécrit le même document (`_version` +1, `_count` inchangé) : l'opération est **idempotente**, on obtient en pratique « exactement une fois » dans l'index. Sans `_id` métier, chaque renvoi créerait un doublon avec un `_id` aléatoire, indétectable après coup.
+
+## Partie 3 — Transformer les logs d'accès
+
+### Exercice 3.1 — Générer les logs
+
+`python data/generate_access_logs.py` → **20 700 lignes** dans `data/access.log` (fichier ignoré par Git). Logstash a été arrêté avant (`docker compose stop logstash`) pour que le pipeline `web` ne lise pas le fichier avant la mise au point. Premières lignes :
+
+```
+203.0.113.123 - - [23/Sep/2026:00:00:39 +0200] "GET /offres/OFF-01468 HTTP/1.1" 200 43686 "https://jobs.example.org/recherche" "Mozilla/5.0 (Linux; Android 15; Pixel 9) …"
+198.51.100.126 - - [23/Sep/2026:00:00:42 +0200] "GET /recherche?q=data&ville=Nantes HTTP/1.1" 200 29517 "-" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) …"
+192.0.2.209 - - [23/Sep/2026:00:00:48 +0200] "GET /api/offres?ville=Paris&page=5 HTTP/1.1" 200 1668 "-" "Mozilla/5.0 (X11; Linux x86_64; rv:143.0) …"
+```
+
+### Exercice 3.2 — Mettre au point le motif
+
+Test du Grok Debugger de Kibana (via son API `POST /api/grokdebugger/simulate`, équivalent du bouton *Simulate*) avec la première ligne et `%{COMBINEDAPACHELOG}` :
+
+```json
+{ "clientip": "203.0.113.123", "ident": "-", "auth": "-",
+  "timestamp": "23/Sep/2026:00:00:39 +0200",
+  "verb": "GET", "request": "/offres/OFF-01468", "httpversion": "1.1",
+  "response": "200", "bytes": "43686",
+  "referrer": "\"https://jobs.example.org/recherche\"",
+  "agent": "\"Mozilla/5.0 (Linux; Android 15; Pixel 9) …\"" }
+```
+
+**Quels champs sont extraits ?** Les 11 éléments de la ligne : adresse du client, identité et utilisateur (`-`), date, méthode, URL, version HTTP, code de réponse, taille, page d'origine et navigateur. Le Grok Debugger utilise le jeu de motifs **historique** (noms `clientip`, `verb`, `request`, `response`…). Dans Logstash, le pipeline est en `ecs_compatibility: v8` : le même motif produit les **noms ECS** du tableau de l'énoncé (`source.address`, `http.request.method`, `url.original`, `http.version`, `http.response.status_code`, `http.response.body.bytes`, `http.request.referrer`, `user_agent.original`) — c'est ce que vérifie l'exercice 3.4.
+
+**Sous quel type apparaît `http.response.status_code` ?** Dans le Grok Debugger : une **chaîne** (`"200"`) — grok extrait du texte et le motif historique ne convertit pas. Dans la version ECS du motif utilisée par Logstash, le code est capturé avec conversion `:int` (`%{INT:[http][response][status_code]:int}`) : il arrive en **entier**, et le modèle `logs-*-*` le mappe en `long` (vérifié en 3.4).
+
+**Pourquoi `timestamp` doit-il encore être traité ?** grok ne fait que **découper du texte** : `timestamp` est une chaîne `"23/Sep/2026:00:00:39 +0200"`, pas une date. `@timestamp` resterait l'heure de **lecture** par Logstash (toutes les lignes datées du 02/10 à la même minute), ce qui rendrait les histogrammes et la recherche par période de la partie 4 inutilisables. Le filtre `date` (format `dd/MMM/yyyy:HH:mm:ss Z`, `locale => "en"` pour `Sep`) convertit cette chaîne en vraie date dans `@timestamp`, en tenant compte du fuseau `+0200`, puis le champ texte est supprimé.
+
+**Motif qui extrait `OFF-01468` de `/offres/OFF-01468/postuler` :**
+
+```
+pattern_definitions => { "OFFRE_ID" => "OFF-[0-9]{5}" }
+match => { "[url][original]" => "^/offres/%{OFFRE_ID:[labels][offre_id]}" }
+```
+
+Test dans le Grok Debugger (motif personnalisé `OFFRE_ID OFF-[0-9]{5}`, pattern `^/offres/%{OFFRE_ID:labels.offre_id}`) → `{"labels": {"offre_id": "OFF-01468"}}`. Le motif est ancré au début (`^`) et ne décrit pas la fin de l'URL : il fonctionne pour `/offres/OFF-01468` comme pour `/offres/OFF-01468/postuler`. Le champ `labels` est le champ ECS prévu pour des étiquettes personnalisées (mappé en `keyword`).
+
+### Exercice 3.3 — `web.conf`
+
+Le `web.conf` fourni par le kit était déjà rempli (le commit du formateur n'a ajouté les `TODO` que dans `offres.conf`) ; chaque bloc est documenté par le `TODO` correspondant :
+
+| TODO | Filtre / réglage | Rôle |
+| --- | --- | --- |
+| 1 | `grok { match => { "message" => "%{COMBINEDAPACHELOG}" } }` | Découpe la ligne en champs ECS |
+| 2 | `date { match => ["timestamp", "dd/MMM/yyyy:HH:mm:ss Z"] locale => "en" remove_field => ["timestamp"] }` | `@timestamp` = heure de la requête |
+| 3 | `useragent { source => "[user_agent][original]" }` | Navigateur, OS, appareil |
+| 4 | `if [url][original] =~ /^\/offres\/OFF-/ { grok { pattern_definitions => { "OFFRE_ID" => "OFF-[0-9]{5}" } … } }` | `labels.offre_id` |
+| 5 | `if "_grokparsefailure" not in [tags] { mutate { remove_field => ["[event][original]"] } }` | Ligne brute gardée seulement en cas d'échec |
+| 6 | `data_stream => "true"`, `data_stream_type => "logs"`, `data_stream_dataset => "web"`, `data_stream_namespace => "default"` | Écriture dans `logs-web-default` |
+
+`--config.test_and_exit` → **`Config Validation Result: OK`**. Démarrage : `docker compose up -d logstash` ; la lecture des 20 700 lignes prend quelques secondes.
+
+### Exercice 3.4 — Vérifier le data stream
+
+| Vérification | Résultat |
+| --- | --- |
+| `GET logs-web-default/_count` | **20 700** documents |
+| `_count` avec `term tags: _grokparsefailure` | **0** échec |
+| Backing index (`GET _data_stream/logs-web-default`) | `.ds-logs-web-default-2026.10.02-000001` |
+| Premier événement (tri `@timestamp` asc) | `"@timestamp": "2026-09-22T22:00:39.000Z"` |
+| `_mapping/field/http.response.status_code` | `"type": "long"` |
+| `index.mode` | **`logsdb`** |
+
+**Combien de documents et d'échecs de grok ?** **20 700** documents (une par ligne du fichier) et **0** document portant le tag `_grokparsefailure` : toutes les lignes respectent le format *combined*.
+
+**Nom de l'index caché et signification :** `.ds-logs-web-default-2026.10.02-000001`
+- `.ds-` : préfixe des *backing indices* de data stream ; le point les rend **cachés** (non visibles avec `*`) ;
+- `logs-web-default` : nom du data stream = **type** `logs`, **dataset** `web`, **namespace** `default` ;
+- `2026.10.02` : **date de création** de cet index (jour de l'ingestion — et non la date des événements, du 23 au 29/09) ;
+- `000001` : **numéro de génération**, incrémenté à chaque *rollover* (nouvel index d'écriture créé par la politique ILM `logs` selon taille ou âge).
+
+Autres informations de `GET _data_stream` : modèle `logs` (*default logs template installed by x-pack*), politique de cycle de vie `logs` gérée par ILM, champ temporel `@timestamp`. Statut **YELLOW** : le modèle `logs` prévoit 1 réplique, impossible à placer sur un cluster à un seul nœud (même situation que l'index `essai` du TP d'introduction).
+
+**Le premier événement est-il daté du 23/09/2026 à 00:00:39 (+02:00) ?** **Oui** : `@timestamp` vaut `2026-09-22T22:00:39.000Z`, c'est-à-dire 23/09/2026 00:00:39 heure de Paris (UTC+2), soit 22:00:39 UTC la veille. Le filtre `date` a pris en compte le fuseau `+0200` de la ligne ; Elasticsearch stocke toujours en UTC et Kibana réaffiche dans le fuseau du navigateur. Sans le filtre `date`, ce serait le 02/10/2026 (heure de lecture).
+
+Document obtenu (extrait) : `source.address: 203.0.113.123`, `http.request.method: GET`, `url.original: /offres/OFF-01468`, `http.version: 1.1`, `http.response.status_code: 200`, `http.response.body.bytes: 43686`, `http.request.referrer: https://jobs.example.org/recherche`, `user_agent.name: Chrome Mobile`, `user_agent.os.full: Android 15`, `user_agent.device.name: Pixel 9`, `labels.offre_id: OFF-01468`, `data_stream.{type,dataset,namespace}`. Le champ `message` (la ligne brute) est conservé ; il se termine par `\r` car `access.log`, généré sous Windows, a des fins de ligne CRLF — sans effet sur l'analyse.
+
+**Quel type pour `http.response.status_code`, et pourquoi est-ce important ?** **`long`** (numérique) : grok l'a converti en entier et le modèle ECS le type en nombre. On peut donc faire des **requêtes par intervalle** (`http.response.status_code >= 500`), des agrégations `range` (2xx / 4xx / 5xx), trier et calculer — indispensable pour l'enquête de la partie 4 (incident en 503, rafale de 404). En `keyword`, `>= 500` serait une comparaison de texte.
+
+**Quel `index.mode` ?** **`logsdb`** : mode de stockage optimisé pour les logs (activé par défaut pour `logs-*-*` depuis la 9.0). Les documents sont triés par hôte et date, compressés plus fortement, et `_source` est reconstruit à partir des colonnes (*synthetic source*) : jusqu'à environ 2 à 3 fois moins de disque qu'un index standard.
+
+### Exercice 3.5 — Rejouer sans doublon ?
+
+Après `docker compose restart logstash` et la fin de la lecture (`web_lus.log` contient deux fois `/data/access.log`) : `GET logs-web-default/_count` → **41 400** (relevé intermédiaire pendant la relecture : 25 075).
+
+**Que constate-t-on ?** Le nombre de documents a **doublé** (2 × 20 700) : chaque ligne de log est maintenant présente **deux fois**. Avec `sincedb_path => "/dev/null"`, le fichier est relu en entier au redémarrage, et chaque ligne est indexée comme un nouveau document avec un `_id` généré aléatoirement par Elasticsearch. Toutes les statistiques de la partie 4 (nombre de requêtes, d'erreurs, de visiteurs) seraient faussées d'un facteur 2.
+
+**Pourquoi le problème ne se posait-il pas pour `offres` ?** Le pipeline `offres` fixe `document_id => "%{id}"` avec l'action `index` : une relecture **remplace** chaque offre (même `_id`, `_version` +1, `_count` inchangé à 5 000 — vérifié aux exercices 1.3 et 1.4). Le pipeline `web` ne donne pas d'`_id` : rien ne permet à Elasticsearch de reconnaître une ligne déjà reçue.
+
+**Peut-on mettre à jour ou remplacer un document dans un data stream ?** **Pas par l'écriture normale.** Un data stream est conçu pour des données en **ajout seul** (*append-only*) : il n'accepte que l'action `create` ; une requête `index` qui viserait un `_id` existant, ou un `_update`, est refusée sur le data stream. Pour corriger exceptionnellement des données, il faut passer par les API `_update_by_query` / `_delete_by_query`, ou adresser directement le *backing index* (`.ds-logs-web-default-…`) avec `if_seq_no`/`if_primary_term`. Le modèle normal est : un événement de log s'écrit une fois et ne change plus.
+
+**Deux solutions pour rejouer sans doublon :**
+1. **Garder la mémoire de lecture (sincedb).** Supprimer `sincedb_path => "/dev/null"` (ou le pointer vers un fichier du volume persistant, par exemple `/usr/share/logstash/data/sincedb_web`). Logstash enregistre alors que `access.log` a été lu en entier et ne le relit pas au redémarrage ; seules les lignes **nouvelles** sont lues (en mode `tail`). Limite : ne protège pas si on supprime la sincedb, si le fichier est recopié (nouvel inode) ou si on veut volontairement rejouer.
+2. **Calculer un `_id` à partir du contenu de la ligne (filtre `fingerprint`)**, ce qui rend l'ingestion **idempotente** comme pour `offres` :
+   ```
+   filter {
+     fingerprint {
+       source => ["message"]
+       target => "[@metadata][fingerprint]"
+       method => "SHA256"
+     }
+   }
+   output {
+     elasticsearch {
+       … data_stream options …
+       document_id => "%{[@metadata][fingerprint]}"
+       action => "create"
+     }
+   }
+   ```
+   Deux lignes identiques donnent la même empreinte, donc le même `_id`. Au rejeu, l'action `create` (la seule autorisée sur un data stream) échoue avec un `409 version_conflict` pour les documents déjà présents : ils ne sont pas dupliqués, et Logstash ne les réessaie pas. L'empreinte est rangée dans `@metadata` pour ne pas être indexée. Limite : deux requêtes réellement distinctes mais strictement identiques (même IP, même seconde, même URL, même navigateur) seraient fusionnées — on peut ajouter `log.file.path` et un numéro de ligne à la source de l'empreinte si nécessaire.
+
+Remise à zéro avant la partie 4 : `docker compose stop logstash`, `DELETE _data_stream/logs-web-default`, `docker compose up -d logstash` → de nouveau 20 700 documents.
