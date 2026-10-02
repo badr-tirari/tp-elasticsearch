@@ -735,3 +735,42 @@ Plusieurs offres sont à égalité à 6 vues (départage par identifiant). Les �
 **Part du trafic mobile :** iOS + Android = **8 155 requêtes sur 20 700, soit ≈ 39,4 %** (les appareils identifiés : iPhone 4 099, Pixel 9 4 056). Le reste (≈ 60,6 %) vient d'ordinateurs, plus les 300 requêtes du robot.
 
 **Trois navigateurs les plus utilisés (`user_agent.name`) :** **Safari (4 150)**, **Mobile Safari (4 099)**, **Chrome (4 058)** — suivis de Chrome Mobile (4 056) et Firefox (4 037). Le filtre `useragent` distingue les versions de bureau et mobiles : en regroupant par famille, **Safari (bureau + mobile) totalise 8 249 requêtes** et **Chrome (bureau + mobile) 8 114**, loin devant Firefox (4 037). La répartition presque uniforme (≈ 20 % chacun) est un effet du générateur, qui tire le navigateur au hasard parmi cinq.
+
+## Partie 5 — Tableau de bord
+
+Tableau de bord **« Site de recrutement — trafic »** (data view *Logs web*), période enregistrée avec le tableau de bord : 23/09/2026 00:00 → 30/09/2026 00:00. Capture : `captures/tableau-de-bord.png`.
+
+![Tableau de bord](captures/tableau-de-bord.png)
+
+| Panneau | Type | Contenu | Valeur sur la semaine |
+| --- | --- | --- | --- |
+| Requêtes | Indicateur (Lens *Metric*) | `count()` | **20 700** |
+| Taux d'erreur serveur | Indicateur, formule | `count(kql='http.response.status_code >= 500') / count()`, format pourcentage | **1,97 %** (407 / 20 700) |
+| Trafic dans le temps | Barres empilées | `@timestamp` (intervalle auto : 3 h) ventilé par `http.response.status_code` | Deux pics : **404** le 26/09 vers 03:00, **503** le 28/09 vers 14:00 |
+| Offres les plus consultées | Tableau | Top 10 de `labels.offre_id` | OFF-03126 et OFF-04662 (8), … |
+| Navigateurs | Anneau | Top 5 de `user_agent.name` (+ « Autre ») | ≈ 20 % chacun, « Autre » 1,45 % = le robot |
+| Offres par ville | Carte (Maps) | Data view `offres`, champ `localisation`, agrégation en grille | Cellules de la grille : Paris 1 492, Lyon 589, Nantes + Rennes 683, Marseille + Montpellier 665… (au zoom national, la grille regroupe les villes proches) |
+
+Remarques de mise au point :
+- Le tableau « Offres les plus consultées » compte **toutes** les requêtes portant un `labels.offre_id` (consultations `GET` **et** candidatures `POST …/postuler`), d'où un classement légèrement différent de l'exercice 4.4, qui ne retient que les `GET` en `200`. On peut aligner les deux en ajoutant au panneau le filtre KQL `http.request.method : GET and http.response.status_code : 200`.
+- La couche de la carte porte sur l'index `offres`, dont le champ temporel est `date_publication` : par défaut, la période du tableau de bord (une semaine) masquait la plupart des offres (61 à Paris au lieu de 1 492). L'option **« Appliquer le filtre temporel global »** a été désactivée sur cette couche pour afficher les 5 000 offres.
+
+**Interactivité vérifiée :** un clic sur le segment rose `503` du 28/09 propose les filtres `@timestamp: 28/09/2026 12:00 → 15:00` et `http.response.status_code: 503`. Une fois appliqués, **tout le tableau de bord se recalcule** : *Requêtes* = **402**, *Taux d'erreur serveur* = **100 %**, l'histogramme passe en tranches de 5 minutes et montre les 9 barres de 14:00 à 14:45, les navigateurs se répartissent entre tous les types (l'incident a touché tous les clients).
+
+### Bonus — règle d'alerte « plus de 50 réponses 5xx en 5 minutes »
+
+Règle de type *Elasticsearch query* (ou *Log threshold*) : index `logs-web-*`, champ temporel `@timestamp`, requête KQL `http.response.status_code >= 500`, condition **nombre de documents > 50 sur les 5 dernières minutes**, vérification toutes les minutes, action via le connecteur *Server log* (message : `{{context.hits}} erreurs 5xx en 5 min sur le site de recrutement`).
+
+**Pourquoi ne se déclenchera-t-elle pas sur ces logs ?** À chaque exécution, la règle cherche les documents dont `@timestamp` est compris dans les **5 dernières minutes par rapport à l'heure actuelle** (fenêtre `now-5m → now`). Nos logs sont datés du 23 au 29/09/2026 : grâce au filtre `date`, leur `@timestamp` est l'heure de la requête d'origine, pas l'heure d'ingestion. Aucun document ne tombe donc dans la fenêtre glissante, quelle que soit l'heure à laquelle la règle s'exécute. Une règle d'alerte surveille le présent ; elle ne rejoue pas l'historique.
+
+**Comment la tester :**
+1. Générer des événements **datés de maintenant** : par exemple envoyer 60 lignes avec code 503 et la date du jour (petit script qui écrit dans `data/access.log` des lignes horodatées à l'heure courante, lues par le pipeline `web`, ou un `POST logs-web-default/_bulk` avec `"@timestamp": "<maintenant>"` et `"http": {"response": {"status_code": 503}}`) ;
+2. attendre l'exécution suivante de la règle (1 min) et vérifier dans *Rules* que l'état passe à **Active**, et dans les journaux de Kibana (`docker compose logs kibana`) le message du connecteur *Server log* ;
+3. vérifier ensuite le retour à **Recovered** une fois les 5 minutes écoulées sans nouvelle erreur. On peut aussi abaisser temporairement le seuil (par exemple > 0) pour valider la chaîne règle → action.
+
+### Restitution — synthèse pour l'équipe d'exploitation
+
+- **Activité normale :** ≈ 2 960 requêtes/jour, 86 % de succès, 7 % de candidatures réussies, trafic régulier jour et nuit, 39 % de mobiles.
+- **Incident du lundi 28/09/2026, 14:00–14:45 :** l'API `/api/offres` a renvoyé **402 erreurs 503** (99,75 % de ses réponses pendant 45 minutes). Le reste du site (accueil, recherche, fiches, candidatures) n'a pas été touché. Les réessais des clients ont multiplié par environ 40 le volume d'appels à l'API. Retour à la normale à 14:45. À suivre : cause côté backend de l'API, politique de réessai des clients, alerte sur le taux de 5xx.
+- **Sécurité, samedi 26/09/2026, 03:12–03:17 :** un scan de vulnérabilités (`zgrab`, IP `203.0.113.66`) a envoyé 300 requêtes en 5 minutes vers `/.env`, `/.git/config`, `/admin`, `/phpmyadmin/`, `/server-status`, `/wp-login.php`. Toutes ont reçu un 404 : rien d'exposé. Recommandations : limitation de débit et blocage des agents de scan connus au niveau du proxy ou du WAF.
+- **Qualité :** 208 liens morts vers des offres inexistantes (`OFF-09xxx`) depuis la page de recherche, à corriger côté application.
