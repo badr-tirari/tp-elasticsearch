@@ -4,3 +4,4 @@ __pycache__/
 data/offres.ndjson
 data/access.log
 tmp/
+data/offres_test.ndjson
