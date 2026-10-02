@@ -615,3 +615,123 @@ Après `docker compose restart logstash` et la fin de la lecture (`web_lus.log` 
    Deux lignes identiques donnent la même empreinte, donc le même `_id`. Au rejeu, l'action `create` (la seule autorisée sur un data stream) échoue avec un `409 version_conflict` pour les documents déjà présents : ils ne sont pas dupliqués, et Logstash ne les réessaie pas. L'empreinte est rangée dans `@metadata` pour ne pas être indexée. Limite : deux requêtes réellement distinctes mais strictement identiques (même IP, même seconde, même URL, même navigateur) seraient fusionnées — on peut ajouter `log.file.path` et un numéro de ligne à la source de l'empreinte si nécessaire.
 
 Remise à zéro avant la partie 4 : `docker compose stop logstash`, `DELETE _data_stream/logs-web-default`, `docker compose up -d logstash` → de nouveau 20 700 documents.
+
+## Partie 4 — Enquête dans Kibana
+
+Data view **Logs web** (`logs-web-*`, champ temporel `@timestamp`), période absolue du 23/09/2026 au 30/09/2026. Requêtes KQL et ES|QL dans `requetes/enquete.txt` ; elles sont exécutées en une fois par `outils/enquete.py` (client Python, `es.esql.query`). **Toutes les heures ci-dessous sont en heure de Paris (UTC+2)** : les requêtes ES|QL ajoutent `EVAL t = @timestamp + 2 hours`, puisque ES|QL calcule en UTC.
+
+### Exercice 4.1 — Vue d'ensemble
+
+Période couverte : du **23/09/2026 00:00:39** au **29/09/2026 23:59:41**, **20 700 requêtes**.
+
+| Code HTTP | Requêtes | Part | Signification |
+| --- | --- | --- | --- |
+| 200 | 17 805 | 86,0 % | Succès |
+| 201 | 1 492 | 7,2 % | Création — les candidatures (`POST …/postuler`) |
+| 404 | 508 | 2,5 % | Ressource introuvable |
+| 304 | 488 | 2,4 % | Non modifié — fichier statique servi depuis le cache du navigateur |
+| 503 | 402 | 1,9 % | Service indisponible |
+| 500 | 5 | 0,02 % | Erreur interne |
+
+| Méthode | Requêtes | Part |
+| --- | --- | --- |
+| GET | 19 208 | 92,8 % |
+| POST | 1 492 | 7,2 % (= exactement les 1 492 réponses 201 : toutes les candidatures ont réussi) |
+
+| Jour | 23/09 | 24/09 | 25/09 | 26/09 | 27/09 | 28/09 | 29/09 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Requêtes | 2 832 | 2 884 | 2 843 | **3 122** | 2 903 | **3 274** | 2 842 |
+
+**Volume moyen : 20 700 / 7 ≈ 2 957 requêtes par jour** (≈ 123 par heure). Le trafic normal est très régulier (≈ 2 830 à 2 900 par jour) ; les deux jours au-dessus de la moyenne sont ceux des anomalies : le **26/09** (+300 requêtes du robot, ex. 4.3) et le **28/09** (+400 requêtes pendant l'incident, ex. 4.2).
+
+### Exercice 4.2 — L'incident
+
+**1. Jour et créneau précis.** Erreurs serveur (`>= 500`) par heure : **402 sur la seule heure du 28/09/2026 14:00–15:00**, contre au plus 1 sur toutes les autres heures de la semaine. Par tranches de 5 minutes, les 503 occupent exactement les 9 tranches de **14:00 à 14:45** (53, 41, 42, 35, 44, 42, 50, 47, 48), et aucune avant ni après. Bornes exactes : première 503 à **14:00:08**, dernière à **14:44:56**.
+→ **Incident le lundi 28/09/2026, de 14:00 à 14:45 (heure de Paris).**
+
+**2. URL touchées et épargnées.** Les **402 réponses 503 concernent toutes `/api/offres`** (l'API de recherche paginée, `?ville=…&page=…`). Pendant le même créneau, les autres pages ont fonctionné normalement :
+
+| Chemin (14:00–14:45) | Requêtes | Erreurs 5xx |
+| --- | --- | --- |
+| `/api/offres` | 403 | **402** |
+| `/offres/OFF-…` (fiches d'offre) | 34 | 0 |
+| `/recherche` | 17 | 0 |
+| `/` (accueil) | 12 | 0 |
+| `/offres/…/postuler` (candidatures) | 7 | 0 |
+| `/static/app.js` | 5 | 0 |
+
+Le site lui-même est resté disponible : seul le **service d'API** était défaillant (backend de l'API, sa base ou une dépendance), pas le serveur web.
+
+**3. Nombre d'erreurs et durée.** **402 réponses 503** en **≈ 45 minutes** (14:00:08 → 14:44:56), soit environ 9 erreurs par minute ; **99,75 %** des appels à l'API ont échoué pendant le créneau (402 sur 403, un seul 200 à 14:20). Les 5 erreurs **500** de la semaine sont sans rapport : isolées (25/09 23:41, 26/09 00:20, 28/09 02:06 et 20:12, 29/09 08:15), une à la fois, aussi sur `/api/offres` — un bruit de fond d'environ 0,02 %.
+
+**4. Comportement des clients.** Le volume sur `/api/offres` a **explosé** :
+
+| `/api/offres`, créneau 14:00–14:45 | 23/09 | 24/09 | 25/09 | 26/09 | 27/09 | **28/09** | 29/09 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Requêtes | 11 | 5 | 11 | 15 | 4 | **403** | 9 |
+
+Par tranches de 5 minutes le 28/09 : 1 à 3 requêtes avant 14:00, **35 à 53 pendant l'incident**, de nouveau 1 à 3 après 14:45 — **≈ 40 fois le trafic habituel** de l'API, alors que les autres pages gardent leur volume normal. **Explication :** les clients de l'API (le front-end JavaScript du site, des applications partenaires) **réessaient automatiquement** quand ils reçoivent un 503 (et les utilisateurs rechargent la page). Ces réessais ne demandent quasiment que la première page (`page=1`) et arrivent de nombreuses adresses différentes. C'est un effet d'**amplification** (*retry storm*) : la panne génère elle-même une surcharge qui peut retarder le rétablissement. Pistes : réessais avec délai exponentiel et gigue (*exponential backoff*), en-tête `Retry-After` sur les 503, disjoncteur (*circuit breaker*) côté client.
+
+**Rapport d'incident (synthèse pour l'équipe d'exploitation).** Le 28/09/2026 de 14:00 à 14:45, l'API `/api/offres` a répondu « 503 Service indisponible » à 402 requêtes sur 403 ; le reste du site (accueil, recherche, fiches, candidatures) n'a pas été affecté. Impact : la liste d'offres chargée par l'API était indisponible pendant 45 minutes ; le volume d'appels a été multiplié par environ 40 par les réessais des clients. Retour à la normale à 14:45 sans erreur résiduelle. Actions proposées : identifier la cause côté backend de l'API (journaux applicatifs, base de données à 14:00), limiter les réessais côté client, alerter sur le taux de 5xx (cf. partie 5).
+
+### Exercice 4.3 — L'activité suspecte
+
+**1. Adresse IP.** 404 par adresse source : **`203.0.113.66` → 300 réponses 404**, puis au plus 3 par adresse pour toutes les autres.
+
+**2. Moment et durée.** Les 404 par minute montrent un bloc de **60 requêtes/minute pendant 5 minutes**, le **samedi 26/09/2026 de 03:12:00 à 03:16:59** (heure de Paris) : 300 requêtes en 300 secondes, soit **une requête par seconde, de façon parfaitement régulière**, en pleine nuit.
+
+**3. URL demandées : que cherchait ce robot ?** Six chemins, demandés en boucle (43 à 59 fois chacun) :
+
+| URL | Ce qui est recherché |
+| --- | --- |
+| `/admin` | Interface d'administration |
+| `/.git/config` | Dépôt Git exposé → code source, adresses de dépôts, parfois des identifiants |
+| `/.env` | Fichier de variables d'environnement → **mots de passe, clés d'API** |
+| `/phpmyadmin/` | Console d'administration de base de données MySQL |
+| `/server-status` | Page d'état Apache → URL internes, adresses des clients |
+| `/wp-login.php` | Page de connexion WordPress (attaque par force brute) |
+
+C'est un **scan de vulnérabilités automatisé** : il ne cherche pas une page du site, il teste des fichiers sensibles et des interfaces d'administration couramment exposés par erreur. Toutes les réponses sont des 404 : **aucune de ces ressources n'existe**, le scan n'a rien trouvé.
+
+**4. `user_agent.original` : comment le distinguer d'un navigateur ?** Les 300 requêtes portent `Mozilla/5.0 zgrab/0.x`. **zgrab** est un outil de scan réseau (projet ZMap). Indices qui le distinguent d'un navigateur :
+- le filtre `useragent` ne reconnaît ni navigateur, ni système, ni appareil (`user_agent.name: Other`, `os.name: Other`, `device.name: Other`), alors qu'un vrai navigateur donne `Chrome` / `Windows`, `Mobile Safari` / `iOS`… ;
+- la chaîne est courte et ne contient ni moteur de rendu (`AppleWebKit`, `Gecko`) ni système ;
+- comportement non humain : une requête par seconde exactement, aucune page référente (`-`), aucun fichier statique ni page normale chargés, 100 % de 404.
+
+Remarque : la même adresse `203.0.113.66` apparaît aussi dans **27 requêtes ordinaires** (pages d'offres, recherches, API) réparties sur la semaine, avec des navigateurs classiques. Une adresse IP peut être partagée (NAT d'entreprise, opérateur mobile, proxy) : bloquer l'IP aurait aussi bloqué ces visiteurs. Mieux vaut bloquer selon le comportement (rafale de 404, chemins sensibles) ou l'agent `zgrab`, et limiter le débit (*rate limiting*, fail2ban, WAF).
+
+**Les autres 404 (208) : d'où viennent-elles, sont-elles inquiétantes ?** Les 208 autres 404 concernent **toutes des fiches d'offre** `/offres/OFF-09xxx` (par exemple `OFF-09938`, `OFF-09776`) : des identifiants **qui n'existent pas** (l'index ne contient que `OFF-00001` à `OFF-05000`). Elles viennent de **172 adresses différentes** (au plus 3 par adresse), sont réparties sur toute la semaine, avec de vrais navigateurs, et ont pour page d'origine `https://jobs.example.org/recherche`. Ce sont des **visiteurs normaux qui suivent des liens morts** — offres expirées ou supprimées encore affichées dans les résultats de recherche (ou dans des favoris, des moteurs de recherche externes). **Pas inquiétant pour la sécurité**, mais c'est un défaut fonctionnel (≈ 1 % des consultations d'offres aboutissent à une erreur) : retirer les offres expirées de la recherche, ou renvoyer un `410 Gone` / une redirection vers des offres similaires.
+
+### Exercice 4.4 — Les offres les plus consultées
+
+Requêtes `GET` en `200` avec un `labels.offre_id`, regroupées par offre (ES|QL), puis détails récupérés **en une seule requête** sur l'index `offres` (`query: { ids: { values: [ … 10 identifiants … ] } }`) :
+
+| Rang | Offre | Vues | Titre | Ville | Contrat |
+| --- | --- | --- | --- | --- | --- |
+| 1 | OFF-04662 | 8 | Développeur Front-end Senior | Bordeaux | Freelance |
+| 2 | OFF-01153 | 7 | Développeur Java Confirmé | Toulouse | Freelance |
+| 3 | OFF-03141 | 7 | Développeur Python Confirmé | Bordeaux | CDI |
+| 4 | OFF-00289 | 6 | Data Scientist Lead | Lyon | CDI |
+| 5 | OFF-00901 | 6 | Développeur Java Junior | Paris | CDI |
+| 6 | OFF-01275 | 6 | Administrateur Bases de Données Lead | Paris | CDI |
+| 7 | OFF-01660 | 6 | Architecte Cloud Senior | Lyon | CDI |
+| 8 | OFF-02899 | 6 | Data Engineer (Alternance) | Lyon | Alternance |
+| 9 | OFF-03126 | 6 | Administrateur Bases de Données Junior | Lyon | CDI |
+| 10 | OFF-03145 | 6 | Data Engineer Lead | Montpellier | CDI |
+
+Plusieurs offres sont à égalité à 6 vues (départage par identifiant). Les écarts sont faibles : avec environ 7 000 consultations réparties sur 5 000 offres, chaque offre est vue 1 à 2 fois en moyenne ; aucune offre ne se détache nettement (trafic simulé tiré au hasard). C'est une **jointure applicative** : Elasticsearch ne joint pas deux index, on enchaîne deux requêtes (logs → identifiants → offres). ES|QL propose aussi `LOOKUP JOIN` sur un index en mode `lookup`.
+
+### Exercice 4.5 — Le public
+
+| Système (`user_agent.os.name`) | Requêtes | Part |
+| --- | --- | --- |
+| Mac OS X | 4 150 | 20,0 % |
+| iOS | 4 099 | 19,8 % |
+| Windows | 4 058 | 19,6 % |
+| Android | 4 056 | 19,6 % |
+| Linux | 4 037 | 19,5 % |
+| Other (robot zgrab) | 300 | 1,4 % |
+
+**Part du trafic mobile :** iOS + Android = **8 155 requêtes sur 20 700, soit ≈ 39,4 %** (les appareils identifiés : iPhone 4 099, Pixel 9 4 056). Le reste (≈ 60,6 %) vient d'ordinateurs, plus les 300 requêtes du robot.
+
+**Trois navigateurs les plus utilisés (`user_agent.name`) :** **Safari (4 150)**, **Mobile Safari (4 099)**, **Chrome (4 058)** — suivis de Chrome Mobile (4 056) et Firefox (4 037). Le filtre `useragent` distingue les versions de bureau et mobiles : en regroupant par famille, **Safari (bureau + mobile) totalise 8 249 requêtes** et **Chrome (bureau + mobile) 8 114**, loin devant Firefox (4 037). La répartition presque uniforme (≈ 20 % chacun) est un effet du générateur, qui tire le navigateur au hasard parmi cinq.

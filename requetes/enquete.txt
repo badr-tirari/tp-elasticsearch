@@ -1,0 +1,228 @@
+# =====================================================================
+# TP2 Logstash — Partie 4 : enquête dans Kibana
+# Data view « Logs web » : motif logs-web-*, champ temporel @timestamp
+# KQL : barre de recherche de Discover. ES|QL : Discover en mode ES|QL (ou POST _query en Dev Tools).
+# Les requêtes ES|QL ajoutent « EVAL t = @timestamp + 2 hours » pour afficher l'heure de Paris (UTC+2).
+# Exécution groupée : python outils/enquete.py
+# =====================================================================
+
+# ---------- Exercice 4.1 — Vue d'ensemble ----------
+# KQL (Discover, data view « Logs web », période absolue 23/09/2026 00:00 → 30/09/2026 00:00)
+*
+
+# ES|QL
+# 4.1_par_code
+FROM logs-web-default
+| STATS n = COUNT(*) BY http.response.status_code
+| SORT n DESC
+
+# 4.1_par_methode
+FROM logs-web-default
+| STATS n = COUNT(*) BY http.request.method
+| SORT n DESC
+
+# 4.1_par_jour
+FROM logs-web-default
+| EVAL t = @timestamp + 2 hours
+| STATS n = COUNT(*) BY jour = DATE_TRUNC(1 day, t)
+| SORT jour
+
+# 4.1_periode
+FROM logs-web-default
+| EVAL t = @timestamp + 2 hours
+| STATS total = COUNT(*), debut = MIN(t), fin = MAX(t)
+
+# ---------- Exercice 4.2 — L'incident ----------
+# KQL
+http.response.status_code >= 500
+http.response.status_code : 503 and url.original : /api/offres*
+# puis période resserrée : 28/09/2026 14:00 → 14:45
+
+# ES|QL
+# 4.2_5xx_par_heure
+FROM logs-web-default
+| WHERE http.response.status_code >= 500
+| EVAL t = @timestamp + 2 hours
+| STATS erreurs = COUNT(*) BY heure = BUCKET(t, 1 hour)
+| SORT erreurs DESC
+| LIMIT 10
+
+# 4.2_5xx_par_code
+FROM logs-web-default
+| WHERE http.response.status_code >= 500
+| STATS n = COUNT(*) BY http.response.status_code
+
+# 4.2_503_par_5min
+FROM logs-web-default
+| WHERE http.response.status_code == 503
+| EVAL t = @timestamp + 2 hours
+| STATS erreurs = COUNT(*) BY tranche = BUCKET(t, 5 minutes)
+| SORT tranche
+
+# 4.2_503_bornes
+FROM logs-web-default
+| WHERE http.response.status_code == 503
+| EVAL t = @timestamp + 2 hours
+| STATS n = COUNT(*), premiere = MIN(t), derniere = MAX(t)
+
+# 4.2_503_url
+FROM logs-web-default
+| WHERE http.response.status_code == 503
+| EVAL chemin = MV_FIRST(SPLIT(url.original, "?"))
+| STATS n = COUNT(*) BY chemin
+| SORT n DESC
+
+# 4.2_pendant_incident_par_chemin
+FROM logs-web-default
+| EVAL t = @timestamp + 2 hours
+| WHERE t >= TO_DATETIME("2026-09-28T14:00:00Z") AND t < TO_DATETIME("2026-09-28T14:45:00Z")
+| EVAL chemin = MV_FIRST(SPLIT(url.original, "?"))
+| EVAL famille = CASE(chemin LIKE "/offres/*/postuler", "/offres/*/postuler", chemin LIKE "/offres/*", "/offres/*", chemin)
+| STATS total = COUNT(*), erreurs_5xx = COUNT(CASE(http.response.status_code >= 500, 1, null)) BY famille
+| SORT total DESC
+
+# 4.2_api_meme_creneau_par_jour
+FROM logs-web-default
+| EVAL t = @timestamp + 2 hours
+| EVAL chemin = MV_FIRST(SPLIT(url.original, "?"))
+| WHERE chemin == "/api/offres"
+| EVAL minute_jour = DATE_EXTRACT("hour_of_day", t) * 60 + DATE_EXTRACT("minute_of_hour", t)
+| WHERE minute_jour >= 840 AND minute_jour < 885
+| STATS requetes_api = COUNT(*) BY jour = DATE_TRUNC(1 day, t)
+| SORT jour
+
+# 4.2_api_par_5min_autour
+FROM logs-web-default
+| EVAL t = @timestamp + 2 hours
+| EVAL chemin = MV_FIRST(SPLIT(url.original, "?"))
+| WHERE chemin == "/api/offres"
+| WHERE t >= TO_DATETIME("2026-09-28T13:30:00Z") AND t < TO_DATETIME("2026-09-28T15:15:00Z")
+| STATS requetes = COUNT(*), ok = COUNT(CASE(http.response.status_code == 200, 1, null)), e503 = COUNT(CASE(http.response.status_code == 503, 1, null)) BY tranche = BUCKET(t, 5 minutes)
+| SORT tranche
+
+# 4.2_500_hors_incident
+FROM logs-web-default
+| WHERE http.response.status_code == 500
+| EVAL t = @timestamp + 2 hours
+| EVAL chemin = MV_FIRST(SPLIT(url.original, "?"))
+| KEEP t, source.address, chemin
+| SORT t
+
+# ---------- Exercice 4.3 — L'activité suspecte ----------
+# KQL
+http.response.status_code : 404
+source.address : "203.0.113.66"
+user_agent.original : *zgrab*
+http.response.status_code : 404 and not source.address : "203.0.113.66"
+
+# ES|QL
+# 4.3_404_par_ip
+FROM logs-web-default
+| WHERE http.response.status_code == 404
+| STATS n = COUNT(*) BY source.address
+| SORT n DESC
+| LIMIT 5
+
+# 4.3_robot_bornes
+FROM logs-web-default
+| WHERE source.address == "203.0.113.66"
+| EVAL t = @timestamp + 2 hours
+| STATS n = COUNT(*), debut = MIN(t), fin = MAX(t), codes = VALUES(http.response.status_code)
+
+# 4.3_robot_url
+FROM logs-web-default
+| WHERE source.address == "203.0.113.66"
+| STATS n = COUNT(*) BY url.original
+| SORT n DESC
+
+# 4.3_robot_agent
+FROM logs-web-default
+| WHERE source.address == "203.0.113.66"
+| STATS n = COUNT(*) BY user_agent.original, user_agent.name, user_agent.device.name
+
+# 4.3_404_par_minute_scan
+FROM logs-web-default
+| WHERE http.response.status_code == 404
+| EVAL t = @timestamp + 2 hours
+| STATS n = COUNT(*) BY minute = BUCKET(t, 1 minute)
+| SORT n DESC
+| LIMIT 8
+
+# 4.3_autres_404
+FROM logs-web-default
+| WHERE http.response.status_code == 404 AND source.address != "203.0.113.66"
+| EVAL chemin = MV_FIRST(SPLIT(url.original, "?"))
+| EVAL famille = CASE(chemin LIKE "/offres/OFF-*", "/offres/OFF-xxxxx", chemin)
+| STATS n = COUNT(*), ips = COUNT_DISTINCT(source.address), exemples = VALUES(labels.offre_id), referents = VALUES(http.request.referrer) BY famille
+
+# 4.3_autres_404_ip_max
+FROM logs-web-default
+| WHERE http.response.status_code == 404 AND source.address != "203.0.113.66"
+| STATS n = COUNT(*) BY source.address
+| SORT n DESC
+| LIMIT 3
+
+# ---------- Exercice 4.4 — Les offres les plus consultées ----------
+# KQL
+http.request.method : GET and http.response.status_code : 200 and labels.offre_id : *
+
+# ES|QL
+# 4.4_top_offres
+FROM logs-web-default
+| WHERE http.request.method == "GET" AND http.response.status_code == 200 AND labels.offre_id IS NOT NULL
+| STATS vues = COUNT(*) BY labels.offre_id
+| SORT vues DESC, labels.offre_id ASC
+| LIMIT 10
+
+# Titre, ville et contrat des 10 offres (une seule requête Dev Tools sur l'index offres)
+GET offres/_search
+{
+  "size": 10,
+  "_source": [
+    "titre",
+    "ville",
+    "contrat",
+    "entreprise"
+  ],
+  "query": {
+    "ids": {
+      "values": [
+        "OFF-04662",
+        "OFF-01153",
+        "OFF-03141",
+        "OFF-00289",
+        "OFF-00901",
+        "OFF-01275",
+        "OFF-01660",
+        "OFF-02899",
+        "OFF-03126",
+        "OFF-03145"
+      ]
+    }
+  }
+}
+
+# ---------- Exercice 4.5 — Le public ----------
+# KQL
+user_agent.os.name : ("Android" or "iOS")
+
+# ES|QL
+# 4.5_par_os
+FROM logs-web-default
+| STATS n = COUNT(*) BY user_agent.os.name
+| SORT n DESC
+
+# 4.5_mobile
+FROM logs-web-default
+| EVAL mobile = user_agent.os.name IN ("Android", "iOS")
+| STATS n = COUNT(*) BY mobile
+
+# 4.5_par_navigateur
+FROM logs-web-default
+| STATS n = COUNT(*) BY user_agent.name
+| SORT n DESC
+
+# 4.5_par_appareil
+FROM logs-web-default
+| STATS n = COUNT(*) BY user_agent.device.name
+| SORT n DESC
