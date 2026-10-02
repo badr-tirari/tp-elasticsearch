@@ -14,7 +14,9 @@ services:
       - ES_PASSWORD=${LOGSTASH_INTERNAL_PASSWORD}
       - LS_JAVA_OPTS=-Xms512m -Xmx512m
     ports:
-      - "127.0.0.1:9600:9600"   # API de supervision de Logstash
+      # Port hôte 9700 : 9600 est dans une plage réservée par Windows (Hyper-V/WSL, voir
+      # netsh interface ipv4 show excludedportrange protocol=tcp). Dans le conteneur : 9600.
+      - "127.0.0.1:9700:9600"   # API de supervision de Logstash
     volumes:
       - ./logstash/config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
       - ./logstash/pipeline:/usr/share/logstash/pipeline:ro

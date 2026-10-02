@@ -286,3 +286,122 @@ Même résultat que l'exercice 4.1 : Paris 57 441,6 €, Grenoble 53 046,2 €, 
 Exemples de volumes obtenus : « développeur python » → 3 996 offres (les « Développeur Python » en tête, score 10,62) ; « données spark » à Lyon en CDI avec salaire ≥ 45 000 → 180 offres (Data Engineer en tête).
 
 Limite observée : `fuzziness: AUTO` élargit parfois trop (ex. « données » → racine `done`, qui rapproche aussi `bonne`). En production, on limiterait le flou aux termes longs (`"fuzziness": "AUTO:4,7"`) ou on le réserverait aux champs `titre`/`competences`.
+
+---
+
+# TP2 — Ingestion et analyse de logs avec Logstash
+
+## Mise en place — compte dédié
+
+Rôle `logstash_writer` (cluster : `monitor`, `manage_index_templates` ; index `offres` et `logs-web-*` : `write`, `create`, `create_index`, `auto_configure`) et utilisateur `logstash_internal` créés. Vérification avec `GET _security/_authenticate` sous ce compte : `"username": "logstash_internal"`, `"roles": ["logstash_writer"]`, realm `default_native`. Requêtes dans `requetes/logstash.txt` (sans le mot de passe).
+
+**Pourquoi ne pas utiliser le compte `elastic` pour Logstash ?**
+`elastic` est le **super-utilisateur** : il peut tout lire, tout supprimer, gérer la sécurité. Principe du **moindre privilège** : Logstash n'a besoin que d'écrire dans `offres` et `logs-web-*`. Si son mot de passe fuit (fichier, log, conteneur compromis) ou si un pipeline est mal écrit (mauvais index, `DELETE`…), les dégâts restent limités à ces index. Un compte dédié permet aussi de **tracer** qui écrit quoi (journal d'audit) et de révoquer ou faire tourner son mot de passe sans toucher aux accès administrateur.
+
+**Que se passerait-il si le pipeline `web` tentait d'écrire dans `logs-generic-default` ?**
+L'écriture serait **refusée** : le rôle n'autorise que les noms `offres` et `logs-web-*`. Elasticsearch renvoie une erreur `403 security_exception` (*action [indices:data/write/bulk[s]] is unauthorized for user [logstash_internal]…*) pour chaque document ; Logstash journalise l'échec et les événements ne sont pas indexés. C'est le comportement voulu : un pipeline ne peut pas polluer un autre flux de données.
+
+**Pourquoi le mot de passe passe-t-il par variable d'environnement plutôt que dans les `.conf` ?**
+Les fichiers `.conf` sont **versionnés dans Git** et partagés : un secret écrit dedans finirait sur GitHub (pénalité au barème, et surtout fuite définitive dans l'historique). Le mot de passe vit dans `.env` (ignoré par Git), Docker Compose l'injecte dans le conteneur (`ES_PASSWORD`), et le `.conf` n'y fait référence que par `${ES_PASSWORD}`. On sépare ainsi **configuration** (versionnée, identique partout) et **secrets** (propres à chaque environnement, faciles à changer).
+
+## Exercice 0 — Premier pipeline
+
+Pipeline `stdin` → `stdout { codec => rubydebug }`. Pour la saisie « Nouvelle offre Data Engineer à Montpellier » :
+
+```
+{
+         "event" => { "original" => "Nouvelle offre Data Engineer à Montpellier" },
+    "@timestamp" => 2026-10-02T12:13:08.878875824Z,
+          "host" => { "hostname" => "f99e5c5adc05" },
+      "@version" => "1",
+       "message" => "Nouvelle offre Data Engineer à Montpellier"
+}
+```
+
+Avec `filter { mutate { uppercase => ["message"] } }` : `"message" => "NOUVELLE OFFRE DATA ENGINEER À MONTPELLIER"`, tandis que `event.original` garde le texte brut. Le filtre transforme le champ de travail, la donnée d'origine reste disponible.
+
+**Quels champs Logstash a-t-il ajoutés à la phrase ?**
+- `message` : la ligne lue (le seul contenu réellement saisi) ;
+- `@timestamp` : horodatage de l'événement ;
+- `@version` : version du format d'événement Logstash (`"1"`) ;
+- `event.original` : copie brute de la ligne, ajoutée en mode ECS v8 (`pipeline.ecs_compatibility: v8` dans les journaux) ;
+- `host.hostname` : nom de la machine qui a produit l'événement — ici l'identifiant du conteneur Docker (`f99e5c5adc05`, différent à chaque `docker compose run`).
+
+Remarque : stdin découpe sur le retour à la ligne. Une commande collée par erreur sans Entrée, suivie de « Bonjour Logstash », a produit **un seul** événement contenant les deux textes : une ligne = un événement.
+
+**Que contient `@timestamp` : l'heure de quoi ?**
+L'heure à laquelle **Logstash a reçu/créé l'événement** (lecture de la ligne), en **UTC** (suffixe `Z` : 12:13 UTC = 14:13 à Paris). Ce n'est pas l'heure à laquelle le fait décrit s'est produit : pour des logs, il faudra la remplacer par la date contenue dans la ligne avec le filtre `date` (partie 3).
+
+**À quoi sert `--path.data /tmp/essai` ?**
+`path.data` est le dossier de travail de Logstash : UUID du nœud, file d'attente persistée, dead letter queue, sincedb, plugins. Logstash pose un **verrou** sur ce dossier : deux instances ne peuvent pas partager le même. Le service `logstash` du compose utilise `/usr/share/logstash/data` (volume `lsdata`) ; en donnant un dossier temporaire distinct à l'instance éphémère, on évite le conflit de verrou (« Logstash could not be started because there is already another instance using the configured data directory ») et on ne pollue pas les données (sincedb, files) du vrai service. Les journaux le confirment : *Creating directory for setting path.data: /tmp/essai*, puis `queue` et `dead_letter_queue` créés dedans.
+
+## Partie 1 — Recharger les offres avec Logstash
+
+### Exercice 1.1 — `offres.conf`
+
+| TODO | Réglage | Rôle |
+| --- | --- | --- |
+| 1 | `mode => "read"` | Lit le fichier en entier, une fois (pas de suivi de fin de fichier comme `tail`) |
+| 2 | `codec => "json"` | Chaque ligne est un objet JSON dont les clés deviennent les champs de l'événement |
+| 3 | `sincedb_path => "/dev/null"` | Pas de mémoire de position : fichier relu à chaque démarrage (labo) |
+| 4 | `file_completed_action => "log"` + `file_completed_log_path` | Ne **supprime pas** le fichier après lecture (défaut `delete` en mode `read`), note son nom dans `offres_lus.log` |
+| 5 | `index => "offres"`, `document_id => "%{id}"`, `action => "index"`, `data_stream => "false"`, `manage_template => false` | Écrit dans l'index existant, `_id` métier, pas de data stream ni de template |
+
+Validation : `--config.test_and_exit` → **`Config Validation Result: OK`**. (Avertissement non bloquant du codec `json` : sans option `target`, les champs sont placés à la racine de l'événement — c'est voulu ici.)
+
+Incident de mise en place : `docker compose up -d logstash` a échoué avec *ports are not available: … 127.0.0.1:9600 … bind: Une tentative d'accès à un socket de manière interdite*. Cause : sous Windows, le port 9600 est dans une **plage réservée** par Hyper-V/WSL (`netsh interface ipv4 show excludedportrange protocol=tcp` → 9502-9601). Correction : port hôte **9700** dans `docker-compose.override.yml` (`127.0.0.1:9700:9600`), l'API reste sur 9600 dans le conteneur.
+
+### Exercice 1.2 — Premier lancement
+
+Avant le lancement : `GET offres/_doc/OFF-00002` → `_version: 3`.
+
+**Les documents sont-ils indexés ?** **Non.** Chaque événement est refusé ; Logstash journalise un `WARN … Could not index event to Elasticsearch` par offre et continue avec les suivantes.
+
+**Quelle erreur, quel code HTTP, quel type d'exception ?**
+`status: 400` (Bad Request) — `strict_dynamic_mapping_exception` : *mapping set to strict, dynamic introduction of [@version] within [_doc] is not allowed*.
+
+**Quels noms de champs sont cités ?** L'erreur cite **`@version`** : c'est le premier champ inconnu rencontré dans le document envoyé, Elasticsearch s'arrête au premier refus. Mais le document reçu par Elasticsearch (visible dans le journal) contient aussi d'autres champs absents du mapping : `@timestamp`, `host.name`, `log.file.path` et `event.original`.
+
+**Lien avec `"dynamic": "strict"` (TP d'introduction, ex. 1.4) :** le mapping de `offres` déclare exactement les 13 champs d'une offre et refuse tout champ supplémentaire (même comportement que le test `champ_inconnu` ou le champ `prime`). Logstash enrichit chaque événement de métadonnées (`@version`, `@timestamp`) et, en mode ECS, l'entrée `file` ajoute `host`, `log.file.path` et `event.original` : ces champs ne sont pas dans le mapping, donc **les 5 000 documents sont rejetés**. Le verrou `strict` joue son rôle : il empêche Logstash de polluer silencieusement l'index avec des champs non prévus.
+
+Remarque : `event.original` se termine par `\r` — le fichier `offres.ndjson`, généré sous Windows, a des fins de ligne CRLF. Le codec `json` ignore ce caractère (espace blanc en fin d'objet), donc sans conséquence sur les données.
+
+### Exercice 1.3 — Corriger
+
+`filter { mutate { remove_field => ["@version", "@timestamp", "host", "log", "event"] } }`. Après `docker compose restart logstash` : plus aucun `Could not index event`, journaux `Pipelines running {count: 2, running_pipelines: [:offres, :web]}`.
+
+| | Avant Logstash | Après correction |
+| --- | --- | --- |
+| `GET offres/_count` | 5 000 | **5 000** |
+| `_version` de `OFF-00002` | 3 | **4** |
+
+**Le nombre de documents a-t-il changé ?** **Non**, toujours 5 000 : chaque offre est envoyée avec `document_id => "%{id}"`, donc l'action `index` **remplace** le document de même `_id` au lieu d'en créer un nouveau.
+
+**Et le `_version` de `OFF-00002` ? Pourquoi ?** Il passe de **3 à 4** : le document a été réécrit une fois de plus (une nouvelle version du même document, pas un doublon). Les tentatives refusées de l'exercice 1.2 n'ont pas incrémenté la version : un document rejeté n'est pas écrit.
+
+**Pourquoi supprimer ces champs plutôt qu'assouplir le mapping ?**
+- Ce sont des **métadonnées techniques de transport** (version du format Logstash, heure de lecture, conteneur, chemin du fichier), sans valeur métier pour un moteur de recherche d'offres.
+- `event.original` recopie la ligne JSON entière : il **doublerait le stockage** de chaque offre.
+- Assouplir (`dynamic: true`) ferait perdre la protection du TP d'introduction : n'importe quel champ inattendu (faute de frappe, `prime`…) serait de nouveau accepté silencieusement, avec un type deviné.
+- Le contenu de l'index reste **identique quelle que soit la source** (`ingest.py` ou Logstash) : le pipeline s'adapte au contrat de données, pas l'inverse.
+
+**Pourquoi l'index `offres` doit-il exister avant le premier démarrage de Logstash ?**
+Avec `manage_template => false`, Logstash n'installe aucun modèle d'index. Si `offres` n'existait pas, le premier envoi le **créerait automatiquement** (le rôle `logstash_writer` a `create_index`/`auto_configure`) avec un **mapping dynamique** deviné à partir du premier document : `titre`/`description` en `text` standard (pas d'analyseur `french`, pas de sous-champ `brut`), `competences` en `text` + `keyword` générique, `localisation` en objet de deux `float` au lieu de `geo_point` (requêtes `geo_distance` impossibles), et aucun verrou `strict`. Le type d'un champ ne pouvant plus changer ensuite, il faudrait supprimer l'index et tout recharger. On crée donc d'abord l'index avec son mapping explicite (TP d'introduction, ex. 1.4), puis Logstash ne fait qu'y écrire.
+
+### Exercice 1.4 — Relancer
+
+Après un nouveau `docker compose restart logstash` : `GET offres/_count` → **5 000** ; `OFF-00002` → **`_version: 5`** (4 juste avant). Lu juste après le redémarrage, le document était encore en version 4 : la lecture et l'envoi prennent quelques secondes.
+
+`/usr/share/logstash/data/offres_lus.log` (rempli grâce à `file_completed_action => "log"`) :
+
+```
+/data/offres.ndjson
+/data/offres.ndjson
+/data/offres.ndjson
+```
+
+**Combien de fois le fichier a-t-il été lu ?** **Trois fois**, une par démarrage du service : exercice 1.2 (documents rejetés), exercice 1.3 (documents indexés, version 3 → 4), exercice 1.4 (version 4 → 5). Avec `sincedb_path => "/dev/null"`, Logstash oublie à chaque démarrage qu'il a déjà lu le fichier et le relit en entier. Le fichier source n'a jamais été supprimé (`log` au lieu de `delete`).
+
+**Avec la sincedb par défaut ?** Logstash enregistrerait dans `path.data` (volume `lsdata`, conservé entre redémarrages) l'identifiant du fichier (inode, périphérique) et la position atteinte. Au redémarrage, il saurait que `offres.ndjson` a été lu jusqu'au bout et **ne le relirait pas** : 0 événement envoyé, `_version` resterait à 4. C'est le comportement voulu en production (ne pas retraiter ce qui l'a déjà été) ; seul un fichier nouveau ou modifié serait lu.
+
+**Si `document_id` n'était pas renseigné ?** Elasticsearch génèrerait un `_id` aléatoire pour chaque événement : chaque lecture **ajouterait** 5 000 nouveaux documents au lieu de remplacer les existants → 10 000 après la 1re lecture réussie (les 5 000 d'origine + 5 000 copies), 15 000 après la 2e, et ainsi de suite. Les comptages et agrégations du TP d'introduction seraient faux. Le `_id` métier rend l'ingestion **idempotente**, exactement comme `ingest.py` (TP d'introduction, ex. 2.2).

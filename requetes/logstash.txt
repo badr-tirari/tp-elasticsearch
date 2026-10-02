@@ -1,0 +1,26 @@
+# =====================================================================
+# TP2 Logstash — Mise en place (Kibana Dev Tools)
+# Le mot de passe n'est PAS versionné : il est lu dans .env (LOGSTASH_INTERNAL_PASSWORD)
+# =====================================================================
+
+# Vérifier que l'index du TP d'introduction est là (attendu : 5000)
+GET offres/_count
+
+# Rôle limité aux besoins de Logstash
+POST _security/role/logstash_writer
+{
+  "cluster": ["monitor", "manage_index_templates"],
+  "indices": [
+    { "names": ["offres", "logs-web-*"],
+      "privileges": ["write", "create", "create_index", "auto_configure"] }
+  ]
+}
+
+# Utilisateur portant ce rôle (même mot de passe que LOGSTASH_INTERNAL_PASSWORD dans .env)
+POST _security/user/logstash_internal
+{ "password": "<LOGSTASH_INTERNAL_PASSWORD>", "roles": ["logstash_writer"],
+  "full_name": "Logstash - ingestion" }
+
+# Vérifications
+GET _security/role/logstash_writer
+GET _security/user/logstash_internal
